@@ -5,6 +5,7 @@ import re
 import logging
 from dotenv import load_dotenv
 from discord.ui import Button, View, Select
+from datetime import datetime
 
 load_dotenv()
 token = os.getenv('DISCORD_TOKEN')
@@ -16,6 +17,9 @@ intents.members = True
 
 ADMIN_CHANNEL = 1474427765859287215
 ADMIN_ROLE_ID = 1474441478918115554
+deadline = None
+reservation = False
+MAX_PLAYERS = 5
 
 class MyBot(commands.Bot):
     def __init__(self):
@@ -39,7 +43,36 @@ async def on_ready():
 async def on_member_join(member):
     await member.send(f'Welcome to the server, {member.name}!')
 
+@bot.command()
+@commands.has_role(ADMIN_ROLE_ID)
+async def 開放報名至(ctx, date_str: str, time_str: str = "23:59"):
+    """
+    用法範例：!設定截止 2026-02-22 22:00
+    如果不輸入時間，預設為當天的 23:59
+    """
+    global deadline, reservation
+    full_str = f"{date_str} {time_str}"
+    
+    try:
+        # 資工核心：將字串轉換為 datetime 物件
+        # %Y: 4位年, %m: 月, %d: 日, %H: 24小時制, %M: 分鐘
+        deadline = datetime.strptime(full_str, "%Y-%m-%d %H:%M")
+        
+        # 格式化輸出給使用者確認
+        formatted_date = deadline.strftime("%Y年%m月%d日 %H:%M")
+        reservation = True
+        await ctx.send(f"✅ 報名截止時間已設定為：**{formatted_date}**")
+        
+    except ValueError:
+        await ctx.send("❌ 格式錯誤！請使用 `YYYY-MM-DD HH:MM` 格式。\n例如：`!開放報名至 2026-02-22 22:00`")
 
+@bot.command()
+@commands.has_role(ADMIN_ROLE_ID)
+async def 結束報名(ctx):
+    global deadline, reservation
+    deadline = None
+    reservation = False
+    await ctx.send("已結束報名。")
 
 # 繳費管理的 View
 # 假設這是你的報名名單與繳費狀態（實務上建議存入資料庫）
@@ -59,7 +92,9 @@ class PaymentView(View):
     def update_select_options(self):
         """根據名單狀態更新下拉選單的選項"""
         options = []
-        for name, paid in payments.items():
+        payments_list = list(payments.items())
+        payments_list = payments_list[:MAX_PLAYERS]  # 只顯示前 MAX_PLAYERS 位
+        for name, paid in payments_list:
             status = "已繳費" if paid else "未繳費"
             options.append(discord.SelectOption(
                 label=name, #實際看到
@@ -99,7 +134,9 @@ class PaymentView(View):
         """產生顯示繳費名單的 Embed"""
         embed = discord.Embed(title="🏸 羽球團繳費清單", color=discord.Color.blue())
         content = ""
-        for name, paid in payments.items():
+        payments_list = list(payments.items())
+        payments_list = payments_list[:MAX_PLAYERS]  # 只顯示前 MAX_PLAYERS 位
+        for name, paid in payments_list:
             status = "✅ 已繳費" if paid else "❌ 未繳費"
             content += f"{name}：{status}\n"
         embed.description = content
@@ -120,23 +157,35 @@ def create_table_embed(data_dict, title="🏸 詳細報名表"):
     embed = discord.Embed(title=title, color=discord.Color.green())
     
     # 分別建立「姓名」與「狀態」兩個直欄
-    names_column = ""
-    status_column = ""
+    items = list(data_dict.items())
+    players = items[:MAX_PLAYERS]  # 只顯示前 MAX_PLAYERS 位
+    waiting_list = items[MAX_PLAYERS:]  # 超過 MAX_PLAYERS 的部分放到候補名單
     
-    for name, status in data_dict.items():
-        names_column += f"{name}\n"
-        status_column += f"{'✅' if status else '❌'}\n"
+    if players:
+        players_str = ""
+        for i, (name, paid) in enumerate(players, start=1):
+            players_str += f"{i}. {name}\n"
+    else:
+        players_str = "目前沒有人報名！"
     
-    # 使用 inline=True 讓兩個 Field 並排
-    embed.add_field(name="姓名", value=names_column or "無", inline=True)
-    embed.add_field(name="繳費狀態", value=status_column or "無", inline=True)
+    embed.add_field(name="報名名單", value=players_str, inline=False)
     
+    if waiting_list:
+        waiting_str = ""
+        for i, (name, paid) in enumerate(waiting_list, start=1):
+            waiting_str += f"{i}. {name}\n"
+        embed.add_field(name="候補名單", value=waiting_str, inline=False)
+
     return embed
 
 @bot.event
 async def on_message(message):
     # 1. 排除機器人自己的訊息，避免無窮迴圈
     if message.author == bot.user:
+        return
+    
+    if message.content.startswith("!"):
+        await bot.process_commands(message)
         return
 
     # 2. 定義正規表示式 (Regex)
@@ -145,7 +194,7 @@ async def on_message(message):
     # (\d+)  -> 抓取後面的數字
     # $      -> 確保結尾沒有多餘字串
     match_add = re.search(r"^(.+)\s*\+\s*(\d+)$", message.content)
-    if match_add:
+    if match_add and reservation and (deadline is None or datetime.now() < deadline):
         # 用 .strip() 確保名字前後沒有殘留空白
         name = match_add.group(1).strip()
         count = int(match_add.group(2))
@@ -161,7 +210,7 @@ async def on_message(message):
         await message.channel.send(f"✅ 收到！{name} {action_text} {count} 位。")
     
     match_remove = re.search(r"^(.+)\s*-\s*(\d+)$", message.content)
-    if match_remove:
+    if match_remove and reservation and (deadline is None or datetime.now() < deadline):
         name = match_remove.group(1).strip()
         count = int(match_remove.group(2))
 
@@ -173,13 +222,16 @@ async def on_message(message):
 
 
     if match_add or match_remove:
-        new_embed = create_table_embed(payments)
-        await message.channel.send(embed=new_embed)
+        if reservation and (deadline is None or datetime.now() < deadline):
+            new_embed = create_table_embed(payments)
+            await message.channel.send(embed=new_embed)
 
-        # admin_channel = bot.get_channel(ADMIN_CHANNEL)
-        # if admin_channel:
-        #     view = PaymentView()
-        #     await admin_channel.send(embed=view.create_embed(), view=view)
+            # admin_channel = bot.get_channel(ADMIN_CHANNEL)
+            # if admin_channel:
+            #     view = PaymentView()
+            #     await admin_channel.send(embed=view.create_embed(), view=view)
+        else:
+            await message.channel.send("⚠️ 目前不在報名期間，無法修改名單！")
 
     await bot.process_commands(message)
 
