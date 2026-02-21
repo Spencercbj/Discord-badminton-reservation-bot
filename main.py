@@ -19,6 +19,7 @@ ADMIN_CHANNEL = 1474427765859287215
 ADMIN_ROLE_ID = 1474441478918115554
 deadline = None
 reservation = False
+reservation_date = None
 MAX_PLAYERS = 5
 
 class MyBot(commands.Bot):
@@ -45,33 +46,37 @@ async def on_member_join(member):
 
 @bot.command()
 @commands.has_role(ADMIN_ROLE_ID)
-async def 開放報名至(ctx, date_str: str, time_str: str = "23:59"):
+async def 開放報名(ctx, res_date: str, word: str, date_str: str, time_str: str = "23:59"):
     """
     用法範例：!設定截止 2026-02-22 22:00
     如果不輸入時間，預設為當天的 23:59
     """
-    global deadline, reservation
+    global deadline, reservation, reservation_date
+    if word != "至":
+        await ctx.send("❌ 格式錯誤！請使用 `!開放報名 YYYY-MM-DD 至 YYYY-MM-DD HH:MM` 格式。")
+        return
     full_str = f"{date_str} {time_str}"
     
     try:
         # 資工核心：將字串轉換為 datetime 物件
         # %Y: 4位年, %m: 月, %d: 日, %H: 24小時制, %M: 分鐘
         deadline = datetime.strptime(full_str, "%Y-%m-%d %H:%M")
-        
+        reservation_date = res_date
         # 格式化輸出給使用者確認
         formatted_date = deadline.strftime("%Y年%m月%d日 %H:%M")
         reservation = True
         await ctx.send(f"✅ 報名截止時間已設定為：**{formatted_date}**")
         
     except ValueError:
-        await ctx.send("❌ 格式錯誤！請使用 `YYYY-MM-DD HH:MM` 格式。\n例如：`!開放報名至 2026-02-22 22:00`")
+        await ctx.send("❌ 格式錯誤！請使用 `!開放報名 YYYY-MM-DD 至 YYYY-MM-DD HH:MM` 格式。")
 
 @bot.command()
 @commands.has_role(ADMIN_ROLE_ID)
 async def 結束報名(ctx):
-    global deadline, reservation
+    global deadline, reservation, reservation_date
     deadline = None
     reservation = False
+    reservation_date = None
     await ctx.send("已結束報名。")
 
 # 繳費管理的 View
@@ -193,11 +198,12 @@ async def on_message(message):
     # \+     -> 匹配加號
     # (\d+)  -> 抓取後面的數字
     # $      -> 確保結尾沒有多餘字串
-    match_add = re.search(r"^(.+)\s*\+\s*(\d+)$", message.content)
+    match_add = re.search(r"^(.+)\s*\+\s*(\d+)\s*(?:\((\d+)\))?$", message.content)
     if match_add and reservation and (deadline is None or datetime.now() < deadline):
         # 用 .strip() 確保名字前後沒有殘留空白
         name = match_add.group(1).strip()
         count = int(match_add.group(2))
+        rank = match_add.group(3)  # 可選的排名資訊，目前未使用
 
         # 3. 更新你的 payments 字典 (資料層)
         # 如果人名不在名單內，就新增進去，預設未繳費 (False)
