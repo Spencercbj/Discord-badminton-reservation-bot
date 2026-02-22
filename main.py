@@ -3,6 +3,7 @@ from discord.ext import commands
 import os
 import re
 import logging
+import aiosqlite
 from dotenv import load_dotenv
 from discord.ui import Button, View, Select
 from datetime import datetime
@@ -22,6 +23,7 @@ reservation = False
 reservation_date = None
 MAX_PLAYERS = 5
 
+
 class MyBot(commands.Bot):
     def __init__(self):
         # 呼叫父類別初始化，設定 prefix 和 intents
@@ -30,8 +32,34 @@ class MyBot(commands.Bot):
     # 這就是你要的官方「初始化通道」
     async def setup_hook(self):
         # 【關鍵】在這裡註冊你的 View，按鈕/選單才不會在重啟後失效
-        self.add_view(PaymentView())
+        self.add_view(await PaymentView.create())
         print("已註冊持久化視圖：PaymentView")
+
+        self.db = await aiosqlite.connect('badminton.db')
+        await self.create_tables()
+
+    async def create_tables(self):
+        """建表邏輯，使用 self.db 操作"""
+        await self.db.execute('''
+                CREATE TABLE IF NOT EXISTS registration_log (
+                    date TEXT,
+                    name TEXT,
+                    dc_id TEXT,
+                    rank INTEGER,
+                    pay INTEGER DEFAULT 0,
+                    PRIMARY KEY (date, name, dc_id)
+                )
+            ''')
+        await self.db.commit()
+        print("📊 資料庫表格檢查完成")
+
+    async def close(self):
+        """當機器人關機時，確保資源被正確釋放"""
+        if self.db:
+            await self.db.close()
+            print("🔒 資料庫連線已安全關閉")
+        await super().close()
+
 
 # 實例化你的機器人類別
 bot = MyBot()
@@ -81,31 +109,37 @@ async def 結束報名(ctx):
 
 # 繳費管理的 View
 # 假設這是你的報名名單與繳費狀態（實務上建議存入資料庫）
-payments = {
-    "小明": False,
-    "小華": False,
-    "老張": False,
-    "小李": False,
-    "小王": False
-}
+# payments = {
+#     "小明": False,
+#     "小華": False,
+#     "老張": False,
+#     "小李": False,
+#     "小王": False
+# }
 
 class PaymentView(View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.update_select_options()
+        
+    @classmethod
+    async def create(cls):
+        self = cls()
+        await self.update_select_options()
+        return self
 
-    def update_select_options(self):
+    async def update_select_options(self):
         """根據名單狀態更新下拉選單的選項"""
         options = []
-        payments_list = list(payments.items())
+        cur = await bot.db.execute('''SELECT name, dc_id, pay FROM registration_log WHERE date = ?''', (reservation_date,))
+        payments_list = await cur.fetchall()
         payments_list = payments_list[:MAX_PLAYERS]  # 只顯示前 MAX_PLAYERS 位
-        for name, paid in payments_list:
-            status = "已繳費" if paid else "未繳費"
+        for name, dc_id, paid in payments_list:
+            status = "已繳費" if paid == 1 else "未繳費"
             options.append(discord.SelectOption(
-                label=name, #實際看到
+                label=f"{name} ({dc_id})", #實際看到
                 description=f"目前狀態：{status}", 
-                value=name, #實際傳回用來查dictionary的key
-                emoji="✅" if paid else "❌"
+                value=f"{name}|{dc_id}", #實際傳回用來查dictionary的key
+                emoji="✅" if paid == 1 else "❌"
             ))
         
         # 移除舊選單並加入新選單
@@ -125,33 +159,42 @@ class PaymentView(View):
 
         # 取得被選擇的名字
         name = interaction.data['values'][0]
+        select_name, select_dc_id = name.split("|")
         # 切換繳費狀態 (True -> False / False -> True)
-        payments[name] = not payments[name]
+        await bot.db.execute('''
+            UPDATE registration_log 
+            SET pay = 1 - pay 
+            WHERE date = ? AND name = ? AND dc_id = ?
+        ''', (reservation_date, select_name, select_dc_id))
+
+        # 做完後手動存檔
+        await bot.db.commit()
         
         # 更新選單內容與 Embed
-        self.update_select_options()
-        new_embed = self.create_embed()
+        await self.update_select_options()
+        new_embed = await self.create_embed()
         
         # 使用 edit_message 達成「原地更新」的效果，不會產生新訊息
         await interaction.response.edit_message(embed=new_embed, view=self)
 
-    def create_embed(self):
+    async def create_embed(self):
         """產生顯示繳費名單的 Embed"""
         embed = discord.Embed(title="🏸 羽球團繳費清單", color=discord.Color.blue())
         content = ""
-        payments_list = list(payments.items())
+        cur = await bot.db.execute('''SELECT name, dc_id, pay FROM registration_log WHERE date = ?''', (reservation_date,))
+        payments_list = await cur.fetchall()
         payments_list = payments_list[:MAX_PLAYERS]  # 只顯示前 MAX_PLAYERS 位
-        for name, paid in payments_list:
+        for name, dc_id, paid in payments_list:
             status = "✅ 已繳費" if paid else "❌ 未繳費"
-            content += f"{name}：{status}\n"
+            content += f"{name} ({dc_id})：{status}\n"
         embed.description = content
         return embed
 
 @bot.command()
 @commands.has_role(ADMIN_ROLE_ID)
 async def 繳費(ctx):
-    view = PaymentView()
-    await ctx.send(embed=view.create_embed(), view=view)
+    view = await PaymentView.create()
+    await ctx.send(embed=await view.create_embed(), view=view)
 @繳費.error
 async def 繳費_error(ctx, error):
     if isinstance(error, commands.MissingRole):
@@ -205,26 +248,39 @@ async def on_message(message):
         count = int(match_add.group(2))
         rank = match_add.group(3)  # 可選的排名資訊，目前未使用
 
+        await bot.db.execute('''
+            INSERT OR REPLACE INTO registration_log (date, name, dc_id, rank)
+            VALUES (?, ?, ?, ?)
+        ''', (reservation_date, name, str(message.author.display_name), rank))
+    
+        await bot.db.commit()
         # 3. 更新你的 payments 字典 (資料層)
         # 如果人名不在名單內，就新增進去，預設未繳費 (False)
-        if name not in payments:
-            payments[name] = False
-            action_text = "已加入名單並報名"
-        else:
-            action_text = "更新報名人數為"
+        # if name not in payments:
+        #     payments[name] = False
+        #     action_text = "已加入名單並報名"
+        # else:
+        #     action_text = "更新報名人數為"
 
-        await message.channel.send(f"✅ 收到！{name} {action_text} {count} 位。")
+        await message.channel.send(f"✅ 收到！{name} 已報名。")
     
     match_remove = re.search(r"^(.+)\s*-\s*(\d+)$", message.content)
     if match_remove and reservation and (deadline is None or datetime.now() < deadline):
         name = match_remove.group(1).strip()
         count = int(match_remove.group(2))
 
-        if name in payments:
-            del payments[name]
-            await message.channel.send(f"❌ 已從名單移除 {name}，共移除 {count} 位。")
-        else:
-            await message.channel.send(f"⚠️ 名單中沒有找到 {name}，無法移除。")
+        await bot.db.execute('''
+            DELETE FROM registration_log 
+            WHERE date = ? AND name = ? AND dc_id = ?
+        ''', (reservation_date, name, str(message.author.id)))
+        
+        await bot.db.commit() # 務必 commit
+        await message.channel.send(f"❌ 已取消 {name} 的報名。")
+        # if name in payments:
+        #     del payments[name]
+        #     await message.channel.send(f"❌ 已從名單移除 {name}，共移除 {count} 位。")
+        # else:
+        #     await message.channel.send(f"⚠️ 名單中沒有找到 {name}，無法移除。")
 
 
     if match_add or match_remove:
