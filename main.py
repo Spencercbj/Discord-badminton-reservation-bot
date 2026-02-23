@@ -17,6 +17,7 @@ intents.message_content = True
 intents.members = True
 
 ADMIN_CHANNEL = 1474427765859287215
+RESERVATION_CHANNEL = 1475537034318971032
 ADMIN_ROLE_ID = 1474441478918115554
 deadline = None
 reservation = False
@@ -35,8 +36,8 @@ class MyBot(commands.Bot):
         await self.create_tables()
 
         # 【關鍵】在這裡註冊你的 View，按鈕/選單才不會在重啟後失效
-        # self.add_view(await PaymentView.create(None))
-        # print("已註冊持久化視圖：PaymentView")
+        self.add_view(await PaymentView.create(None))
+        print("已註冊持久化視圖：PaymentView")
 
     async def create_tables(self):
         """建表邏輯，使用 self.db 操作"""
@@ -310,6 +311,10 @@ async def on_message(message):
         return
     
     if message.content.startswith("!"):
+        await bot.process_commands(message)
+        return
+    
+    if message.channel.id != RESERVATION_CHANNEL:
         await bot.process_commands(message)
         return
 
