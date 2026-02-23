@@ -35,8 +35,8 @@ class MyBot(commands.Bot):
         await self.create_tables()
 
         # 【關鍵】在這裡註冊你的 View，按鈕/選單才不會在重啟後失效
-        self.add_view(await PaymentView.create())
-        print("已註冊持久化視圖：PaymentView")
+        # self.add_view(await PaymentView.create(None))
+        # print("已註冊持久化視圖：PaymentView")
 
     async def create_tables(self):
         """建表邏輯，使用 self.db 操作"""
@@ -50,6 +50,13 @@ class MyBot(commands.Bot):
                     pay INTEGER DEFAULT 0,
                     inserted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (date, name, dc_id)
+                )
+            ''')
+        
+        await self.db.execute('''
+                CREATE TABLE IF NOT EXISTS max_players (
+                    date TEXT PRIMARY KEY,
+                    max_count INTEGER
                 )
             ''')
         await self.db.commit()
@@ -96,7 +103,10 @@ async def 開放報名(ctx, res_date: str, word: str, date_str: str, time_str: s
         formatted_date = deadline.strftime("%Y年%m月%d日 %H:%M")
         reservation = True
         await ctx.send(f"✅ 報名截止時間已設定為：**{formatted_date}**")
-        
+        await bot.db.execute('''
+            INSERT OR REPLACE INTO max_players (date, max_count) VALUES (?, ?)
+        ''', (reservation_date, MAX_PLAYERS))
+        await bot.db.commit()
     except ValueError:
         await ctx.send("❌ 格式錯誤！請使用 `!開放報名 YYYY-MM-DD 至 YYYY-MM-DD HH:MM` 格式。")
 @開放報名.error
@@ -108,8 +118,22 @@ async def 開放報名_error(ctx, error):
 @commands.has_role(ADMIN_ROLE_ID)
 async def 人數(ctx, count: int):
     global MAX_PLAYERS
-    MAX_PLAYERS = count
-    await ctx.send(f"已設定最大報名人數為 {MAX_PLAYERS} 人。")
+    try:
+        MAX_PLAYERS = count
+        if reservation_date is None:
+            await ctx.send("⚠️ 請先使用 `!開放報名` 指令設定報名日期，才能設定人數上限！")
+            return
+        await bot.db.execute('''
+            INSERT OR REPLACE INTO max_players (date, max_count) VALUES (?, ?)
+        ''', (reservation_date, count))
+        await bot.db.commit()
+        await ctx.send(f"已設定最大報名人數為 {MAX_PLAYERS} 人。")
+    except ValueError:
+        await ctx.send(f"❌ 請輸入有效的數字，例如：`!人數 5`")
+@人數.error
+async def 人數_error(ctx, error):
+    if isinstance(error, commands.MissingRole):
+        await ctx.send("⚠️ 你沒有權限使用這個指令！")
 
 @bot.command()
 @commands.has_role(ADMIN_ROLE_ID)
@@ -135,21 +159,33 @@ async def 結束報名_error(ctx, error):
 # }
 
 class PaymentView(View):
-    def __init__(self):
+    def __init__(self, target_day):
         super().__init__(timeout=None)
+        self.target_day = target_day
         
     @classmethod
-    async def create(cls):
-        self = cls()
-        await self.update_select_options()
+    async def create(cls, target_day=None):
+        self = cls(target_day)
+        if target_day:
+            await self.update_select_options()
         return self
 
     async def update_select_options(self):
         """根據名單狀態更新下拉選單的選項"""
         options = []
-        cur = await bot.db.execute('''SELECT name, dc_id, dc_name, pay FROM registration_log WHERE date = ? ORDER BY inserted_at ASC''', (reservation_date,))
+        cur = await bot.db.execute('''SELECT name, dc_id, dc_name, pay FROM registration_log WHERE date = ? ORDER BY inserted_at ASC''', (self.target_day,))
         payments_list = await cur.fetchall()
-        payments_list = payments_list[:MAX_PLAYERS]  # 只顯示前 MAX_PLAYERS 位
+        cur_max = await bot.db.execute('''SELECT max_count FROM max_players WHERE date = ?''', (self.target_day,))
+        max_players_row = await cur_max.fetchone()
+        max_players = max_players_row[0] if max_players_row else MAX_PLAYERS  # 如果沒有設定人數上限，使用預設值
+        payments_list = payments_list[:max_players]  # 只顯示前 MAX_PLAYERS 位
+        if not payments_list:
+            options.append(discord.SelectOption(
+                label="目前沒有人報名！",
+                description="當有成員報名後，才會在這裡顯示繳費狀態。",
+                value="no_players",
+                emoji="⚠️"
+            ))
         for name, dc_id, dc_name, paid in payments_list:
             status = "已繳費" if paid == 1 else "未繳費"
             options.append(discord.SelectOption(
@@ -174,6 +210,17 @@ class PaymentView(View):
             await interaction.response.send_message("⚠️ 你沒有權限修改繳費狀態！", ephemeral=True)
             return
 
+        # 2. 【核心】如果 self.target_day 是 None，從 Embed 標題找回日期
+        current_date = self.target_day
+        if not current_date:
+            try:
+                # 假設標題是 "🏸 羽球團繳費清單 (2026-02-22)"
+                title = interaction.message.embeds[0].title
+                current_date = re.search(r"\d{4}-\d{2}-\d{2}", title).group()
+                self.target_day = current_date # 找回記憶，存入 self
+            except Exception:
+                await interaction.response.send_message("❌ 無法辨識日期，請重新輸入 `!繳費` 產生新選單。", ephemeral=True)
+                return
         # 取得被選擇的名字
         name = interaction.data['values'][0]
         select_name, select_dc_id = name.split("|")
@@ -182,7 +229,7 @@ class PaymentView(View):
             UPDATE registration_log 
             SET pay = 1 - pay 
             WHERE date = ? AND name = ? AND dc_id = ?
-        ''', (reservation_date, select_name, select_dc_id))
+        ''', (current_date, select_name, select_dc_id))
 
         # 做完後手動存檔
         await bot.db.commit()
@@ -196,11 +243,17 @@ class PaymentView(View):
 
     async def create_embed(self):
         """產生顯示繳費名單的 Embed"""
-        embed = discord.Embed(title="🏸 羽球團繳費清單", color=discord.Color.blue())
+        embed = discord.Embed(title=f"🏸 羽球團繳費清單({self.target_day})", color=discord.Color.blue())
         content = ""
-        cur = await bot.db.execute('''SELECT name, dc_name, pay FROM registration_log WHERE date = ? ORDER BY inserted_at ASC''', (reservation_date,))
+        cur = await bot.db.execute('''SELECT name, dc_name, pay FROM registration_log WHERE date = ? ORDER BY inserted_at ASC''', (self.target_day,))
         payments_list = await cur.fetchall()
-        payments_list = payments_list[:MAX_PLAYERS]  # 只顯示前 MAX_PLAYERS 位
+        if not payments_list:
+            content = "目前沒有人報名！"
+        
+        cur_max = await bot.db.execute('''SELECT max_count FROM max_players WHERE date = ?''', (self.target_day,))
+        max_players_row = await cur_max.fetchone()
+        max_players = max_players_row[0] if max_players_row else MAX_PLAYERS  # 如果沒有設定人數上限，使用預設值
+        payments_list = payments_list[:max_players]  # 只顯示前 MAX_PLAYERS 位
         for name, dc_name, paid in payments_list:
             status = "✅ 已繳費" if paid else "❌ 未繳費"
             content += f"{name} ({dc_name})：{status}\n"
@@ -209,8 +262,15 @@ class PaymentView(View):
 
 @bot.command()
 @commands.has_role(ADMIN_ROLE_ID)
-async def 繳費(ctx):
-    view = await PaymentView.create()
+async def 繳費(ctx , date: str = None):
+    if date:
+        pay_date = date
+    else:
+        if reservation_date is None:
+            await ctx.send("請輸入要查的繳費名單日期，例如：!繳費 2025-04-05")
+            return
+        pay_date = reservation_date
+    view = await PaymentView.create(pay_date)
     await ctx.send(embed=await view.create_embed(), view=view)
 @繳費.error
 async def 繳費_error(ctx, error):
@@ -218,13 +278,13 @@ async def 繳費_error(ctx, error):
         await ctx.send("⚠️ 你沒有權限使用這個指令！")
 
 
-def create_table_embed(data_dict, title="🏸 詳細報名表"):
+def create_table_embed(data_dict, title="🏸 詳細報名表", players_num=None):
     embed = discord.Embed(title=title, color=discord.Color.green())
     
     # 分別建立「姓名」與「狀態」兩個直欄
     items = list(data_dict.items())
-    players = items[:MAX_PLAYERS]  # 只顯示前 MAX_PLAYERS 位
-    waiting_list = items[MAX_PLAYERS:]  # 超過 MAX_PLAYERS 的部分放到候補名單
+    players = items[:players_num] if players_num is not None else items[:MAX_PLAYERS]  # 只顯示前 MAX_PLAYERS 位
+    waiting_list = items[players_num:] if players_num is not None else items[MAX_PLAYERS:]  # 超過 MAX_PLAYERS 的部分放到候補名單
     
     if players:
         players_str = ""
@@ -285,14 +345,31 @@ async def on_message(message):
     if match_remove and reservation and (deadline is None or datetime.now() < deadline):
         name = match_remove.group(1).strip()
         count = int(match_remove.group(2))
+        cur = await bot.db.execute(
+            'SELECT dc_id FROM registration_log WHERE date = ? AND name = ?', 
+            (reservation_date, name)
+        )
+        row = await cur.fetchone()
 
-        await bot.db.execute('''
-            DELETE FROM registration_log 
-            WHERE date = ? AND name = ? AND dc_id = ?
-        ''', (reservation_date, name, str(message.author.id)))
-        
-        await bot.db.commit() # 務必 commit
-        await message.channel.send(f"❌ 已取消 {name} 的報名。")
+
+        if row:
+            stored_dc_id = row[0]
+            # 2. 檢查：發訊息者是「本人」 OR 擁有「管理員權限」
+            is_admin = any(role.id == ADMIN_ROLE_ID for role in message.author.roles)
+            
+            if str(message.author.id) == stored_dc_id or is_admin:
+                # 權限通過，執行刪除
+                await bot.db.execute(
+                    'DELETE FROM registration_log WHERE date = ? AND name = ?', 
+                    (reservation_date, name)
+                )
+                await bot.db.commit()
+                await message.channel.send(f"❌ 已取消 {name} 的報名。")
+            else:
+                # 權限不符
+                await message.channel.send(f"⚠️ 你沒有權限取消 **{name}** 的報名！這筆資料是由其他成員登記的。")
+        else:
+            await message.channel.send(f"⚠️ 在名單中找不到 **{name}**。")
         # if name in payments:
         #     del payments[name]
         #     await message.channel.send(f"❌ 已從名單移除 {name}，共移除 {count} 位。")
@@ -318,11 +395,25 @@ async def on_message(message):
     await bot.process_commands(message)
 
 @bot.command()
-async def 名單(ctx):
-    cur = await bot.db.execute('''SELECT name, dc_name FROM registration_log WHERE date = ? ORDER BY inserted_at ASC''', (reservation_date,))
+async def 名單(ctx, date: str = None):
+    if date is None:
+        if reservation_date is None:
+            await ctx.send("請輸入要查的名單日期，例如：!名單 2025-04-05")
+            return
+        date = reservation_date
+    cur = await bot.db.execute('''SELECT name, dc_name FROM registration_log WHERE date = ? ORDER BY inserted_at ASC''', (date,))
     payments_list = await cur.fetchall()
+    if not payments_list:
+        await ctx.send(f"目前 {date} 沒有人報名！")
+        return
     payments_dict = {name: dc_name for name, dc_name in payments_list}
-    embed = create_table_embed(payments_dict)
+    
+    # 查詢該日期的最大人數限制
+    cur_max = await bot.db.execute('''SELECT max_count FROM max_players WHERE date = ?''', (date,))
+    max_players_row = await cur_max.fetchone()
+    max_players = max_players_row[0] if max_players_row else MAX_PLAYERS  # 如果沒有設定人數上限，使用預設值
+
+    embed = create_table_embed(payments_dict, players_num=max_players)
     await ctx.send(embed=embed)
 
 
