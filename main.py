@@ -31,12 +31,12 @@ class MyBot(commands.Bot):
 
     # 這就是你要的官方「初始化通道」
     async def setup_hook(self):
+        self.db = await aiosqlite.connect('badminton.db')
+        await self.create_tables()
+
         # 【關鍵】在這裡註冊你的 View，按鈕/選單才不會在重啟後失效
         self.add_view(await PaymentView.create())
         print("已註冊持久化視圖：PaymentView")
-
-        self.db = await aiosqlite.connect('badminton.db')
-        await self.create_tables()
 
     async def create_tables(self):
         """建表邏輯，使用 self.db 操作"""
@@ -45,8 +45,10 @@ class MyBot(commands.Bot):
                     date TEXT,
                     name TEXT,
                     dc_id TEXT,
+                    dc_name TEXT,
                     rank INTEGER,
                     pay INTEGER DEFAULT 0,
+                    inserted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (date, name, dc_id)
                 )
             ''')
@@ -97,6 +99,17 @@ async def 開放報名(ctx, res_date: str, word: str, date_str: str, time_str: s
         
     except ValueError:
         await ctx.send("❌ 格式錯誤！請使用 `!開放報名 YYYY-MM-DD 至 YYYY-MM-DD HH:MM` 格式。")
+@開放報名.error
+async def 開放報名_error(ctx, error):
+    if isinstance(error, commands.MissingRole):
+        await ctx.send("⚠️ 你沒有權限使用這個指令！")
+
+@bot.command()
+@commands.has_role(ADMIN_ROLE_ID)
+async def 人數(ctx, count: int):
+    global MAX_PLAYERS
+    MAX_PLAYERS = count
+    await ctx.send(f"已設定最大報名人數為 {MAX_PLAYERS} 人。")
 
 @bot.command()
 @commands.has_role(ADMIN_ROLE_ID)
@@ -106,6 +119,10 @@ async def 結束報名(ctx):
     reservation = False
     reservation_date = None
     await ctx.send("已結束報名。")
+@結束報名.error
+async def 結束報名_error(ctx, error):
+    if isinstance(error, commands.MissingRole):
+        await ctx.send("⚠️ 你沒有權限使用這個指令！")
 
 # 繳費管理的 View
 # 假設這是你的報名名單與繳費狀態（實務上建議存入資料庫）
@@ -130,13 +147,13 @@ class PaymentView(View):
     async def update_select_options(self):
         """根據名單狀態更新下拉選單的選項"""
         options = []
-        cur = await bot.db.execute('''SELECT name, dc_id, pay FROM registration_log WHERE date = ?''', (reservation_date,))
+        cur = await bot.db.execute('''SELECT name, dc_id, dc_name, pay FROM registration_log WHERE date = ? ORDER BY inserted_at ASC''', (reservation_date,))
         payments_list = await cur.fetchall()
         payments_list = payments_list[:MAX_PLAYERS]  # 只顯示前 MAX_PLAYERS 位
-        for name, dc_id, paid in payments_list:
+        for name, dc_id, dc_name, paid in payments_list:
             status = "已繳費" if paid == 1 else "未繳費"
             options.append(discord.SelectOption(
-                label=f"{name} ({dc_id})", #實際看到
+                label=f"{name} ({dc_name})", #實際看到
                 description=f"目前狀態：{status}", 
                 value=f"{name}|{dc_id}", #實際傳回用來查dictionary的key
                 emoji="✅" if paid == 1 else "❌"
@@ -181,12 +198,12 @@ class PaymentView(View):
         """產生顯示繳費名單的 Embed"""
         embed = discord.Embed(title="🏸 羽球團繳費清單", color=discord.Color.blue())
         content = ""
-        cur = await bot.db.execute('''SELECT name, dc_id, pay FROM registration_log WHERE date = ?''', (reservation_date,))
+        cur = await bot.db.execute('''SELECT name, dc_name, pay FROM registration_log WHERE date = ? ORDER BY inserted_at ASC''', (reservation_date,))
         payments_list = await cur.fetchall()
         payments_list = payments_list[:MAX_PLAYERS]  # 只顯示前 MAX_PLAYERS 位
-        for name, dc_id, paid in payments_list:
+        for name, dc_name, paid in payments_list:
             status = "✅ 已繳費" if paid else "❌ 未繳費"
-            content += f"{name} ({dc_id})：{status}\n"
+            content += f"{name} ({dc_name})：{status}\n"
         embed.description = content
         return embed
 
@@ -211,8 +228,8 @@ def create_table_embed(data_dict, title="🏸 詳細報名表"):
     
     if players:
         players_str = ""
-        for i, (name, paid) in enumerate(players, start=1):
-            players_str += f"{i}. {name}\n"
+        for i, (name, dc_name) in enumerate(players, start=1):
+            players_str += f"{i}. {name} ({dc_name})\n"
     else:
         players_str = "目前沒有人報名！"
     
@@ -220,8 +237,8 @@ def create_table_embed(data_dict, title="🏸 詳細報名表"):
     
     if waiting_list:
         waiting_str = ""
-        for i, (name, paid) in enumerate(waiting_list, start=1):
-            waiting_str += f"{i}. {name}\n"
+        for i, (name, dc_name) in enumerate(waiting_list, start=1):
+            waiting_str += f"{i}. {name} ({dc_name})\n"
         embed.add_field(name="候補名單", value=waiting_str, inline=False)
 
     return embed
@@ -249,9 +266,9 @@ async def on_message(message):
         rank = match_add.group(3)  # 可選的排名資訊，目前未使用
 
         await bot.db.execute('''
-            INSERT OR REPLACE INTO registration_log (date, name, dc_id, rank)
-            VALUES (?, ?, ?, ?)
-        ''', (reservation_date, name, str(message.author.display_name), rank))
+            INSERT OR REPLACE INTO registration_log (date, name, dc_id, dc_name,  rank)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (reservation_date, name, str(message.author.id), str(message.author.display_name), rank))
     
         await bot.db.commit()
         # 3. 更新你的 payments 字典 (資料層)
@@ -285,7 +302,10 @@ async def on_message(message):
 
     if match_add or match_remove:
         if reservation and (deadline is None or datetime.now() < deadline):
-            new_embed = create_table_embed(payments)
+            cur = await bot.db.execute('''SELECT name, dc_name FROM registration_log WHERE date = ? ORDER BY inserted_at ASC''', (reservation_date,))
+            payments_list = await cur.fetchall()
+            payments_dict = {name: dc_name for name, dc_name in payments_list}
+            new_embed = create_table_embed(payments_dict)
             await message.channel.send(embed=new_embed)
 
             # admin_channel = bot.get_channel(ADMIN_CHANNEL)
@@ -299,7 +319,10 @@ async def on_message(message):
 
 @bot.command()
 async def 名單(ctx):
-    embed = create_table_embed(payments)
+    cur = await bot.db.execute('''SELECT name, dc_name FROM registration_log WHERE date = ? ORDER BY inserted_at ASC''', (reservation_date,))
+    payments_list = await cur.fetchall()
+    payments_dict = {name: dc_name for name, dc_name in payments_list}
+    embed = create_table_embed(payments_dict)
     await ctx.send(embed=embed)
 
 
