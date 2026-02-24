@@ -28,7 +28,7 @@ MAX_PLAYERS = 5
 class MyBot(commands.Bot):
     def __init__(self):
         # 呼叫父類別初始化，設定 prefix 和 intents
-        super().__init__(command_prefix='!', intents=intents)
+        super().__init__(command_prefix=['!', '！'], intents=intents)
 
     # 這就是你要的官方「初始化通道」
     async def setup_hook(self):
@@ -80,7 +80,7 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member):
-    await member.send(f'Welcome to the server, {member.name}!')
+    await member.send(f'歡迎加入羽球隊! 請先去公告區看報名教學。')
 
 @bot.command()
 @commands.has_role(ADMIN_ROLE_ID)
@@ -102,12 +102,12 @@ async def 開放報名(ctx, res_date: str, word: str, date_str: str, time_str: s
         reservation_date = res_date
         # 格式化輸出給使用者確認
         formatted_date = deadline.strftime("%Y年%m月%d日 %H:%M")
-        reservation = True
-        await ctx.send(f"✅ 報名截止時間已設定為：**{formatted_date}**")
-        await bot.db.execute('''
-            INSERT OR REPLACE INTO max_players (date, max_count) VALUES (?, ?)
-        ''', (reservation_date, MAX_PLAYERS))
-        await bot.db.commit()
+        reservation = False
+        await ctx.send(
+            f"報名日期已設定為：**{res_date}**\n"
+            f"截止時間：**{formatted_date}**\n"
+            f"⚠️ **報名尚未開啟！** 請輸入 `!人數 <數字>` 以設定上限並正式開放報名。"
+        )
     except ValueError:
         await ctx.send("❌ 格式錯誤！請使用 `!開放報名 YYYY-MM-DD 至 YYYY-MM-DD HH:MM` 格式。")
 @開放報名.error
@@ -118,7 +118,7 @@ async def 開放報名_error(ctx, error):
 @bot.command()
 @commands.has_role(ADMIN_ROLE_ID)
 async def 人數(ctx, count: int):
-    global MAX_PLAYERS
+    global MAX_PLAYERS, reservation, reservation_date
     try:
         MAX_PLAYERS = count
         if reservation_date is None:
@@ -128,6 +128,7 @@ async def 人數(ctx, count: int):
             INSERT OR REPLACE INTO max_players (date, max_count) VALUES (?, ?)
         ''', (reservation_date, count))
         await bot.db.commit()
+        reservation = True
         await ctx.send(f"已設定最大報名人數為 {MAX_PLAYERS} 人。")
     except ValueError:
         await ctx.send(f"❌ 請輸入有效的數字，例如：`!人數 5`")
@@ -280,7 +281,7 @@ async def 繳費_error(ctx, error):
 
 
 def create_table_embed(data_dict, title="🏸 詳細報名表", players_num=None):
-    embed = discord.Embed(title=title, color=discord.Color.green())
+    embed = discord.Embed(title=f"{title} 最多{players_num} 人", color=discord.Color.green())
     
     # 分別建立「姓名」與「狀態」兩個直欄
     items = list(data_dict.items())
@@ -310,7 +311,7 @@ async def on_message(message):
     if message.author == bot.user:
         return
     
-    if message.content.startswith("!"):
+    if message.content.startswith(("!", "！")):
         await bot.process_commands(message)
         return
     
@@ -387,7 +388,12 @@ async def on_message(message):
             cur = await bot.db.execute('''SELECT name, dc_name FROM registration_log WHERE date = ? ORDER BY inserted_at ASC''', (reservation_date,))
             payments_list = await cur.fetchall()
             payments_dict = {name: dc_name for name, dc_name in payments_list}
-            new_embed = create_table_embed(payments_dict)
+
+            cur_max = await bot.db.execute('SELECT max_count FROM max_players WHERE date = ?', (reservation_date,))
+            row_max = await cur_max.fetchone()
+            current_limit = row_max[0] if row_max else MAX_PLAYERS
+
+            new_embed = create_table_embed(payments_dict, players_num=current_limit)
             await message.channel.send(embed=new_embed)
 
             # admin_channel = bot.get_channel(ADMIN_CHANNEL)
@@ -423,3 +429,6 @@ async def 名單(ctx, date: str = None):
 
 
 bot.run(token, log_handler=handler, log_level=logging.DEBUG)
+
+# tmux ls
+# tmux a -t badminton
